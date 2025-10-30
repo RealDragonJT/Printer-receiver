@@ -30,7 +30,17 @@ venv\Scripts\activate
 pip install -r pi_requirements.txt
 ```
 
-### 2. Configure Environment
+### 2. Run setup wizard (recommended)
+
+Run the guided setup to configure your token and printer connection:
+
+```bash
+python pi_server/setup.py
+```
+
+This writes `.env` (with `PRINTER_SHARED_SECRET`) and `config.ini` (connection settings). You can still configure manually as below.
+
+### Manual: configure environment
 
 Create a `.env` file in the project root:
 
@@ -38,17 +48,11 @@ Create a `.env` file in the project root:
 # Required (get these from the Discord bot when linking)
 PRINTER_SHARED_SECRET=your_shared_secret_here
 
-# Testing vs Production
-TESTING_MODE=true
-
 # Server Configuration
 HOST=0.0.0.0
 PORT=5000
 
-# Printer Connection (only needed in production mode)
-# For USB: leave unset (defaults will be used)
-# For Network: PRINTER_IP=192.168.1.100
-# For Serial: PRINTER_SERIAL=/dev/ttyUSB0
+# Printer Connection is configured in config.ini (see below)
 
 # Advanced: USB write settings (optional)
 # PRINTER_WRITE_CHUNK_SIZE=128
@@ -107,18 +111,23 @@ python -m pi_server.app
 - `PRINTER_WRITE_CHUNK_SIZE` - Chunk size for USB writes (default: 128 on Windows, 2048 on Linux)
 - `PRINTER_WRITE_CHUNK_DELAY` - Delay between chunks in seconds (default: 0.05 on Windows, 0.0 on Linux)
 
-### Testing Mode vs Production Mode
+### Connection via config.ini
 
-**Testing Mode** (`TESTING_MODE=true`):
-- Simulates printing without a physical printer
-- Generates preview images for testing
-- Perfect for development and testing the bot connection
-- `PRINTER_SHARED_SECRET` is optional (but recommended)
+The setup wizard writes a `config.ini` like:
 
-**Production Mode** (`TESTING_MODE=false`):
-- Connects to real printer hardware
-- **REQUIRES** `PRINTER_SHARED_SECRET` for security
-- Supports USB, Network, or Serial connections
+```
+[printer]
+connection=usb  # usb|network|serial
+# USB:
+usb_vendor_id=0x04B8
+usb_product_id=0x0202
+# Network:
+# ip=192.168.1.100
+# port=9100
+# Serial:
+# device=/dev/ttyUSB0
+# baudrate=19200
+```
 
 ## Hardware Setup
 
@@ -422,6 +431,24 @@ Receive and process a print job.
   "message": "Error description",
   "error_code": "OUT_OF_PAPER" | "PRINTER_OFFLINE" | "PRINT_FAILED" | "SERVER_ERROR"
 }
+```
+
+### POST `/verify`
+
+Signed verification without printing.
+
+Request:
+```json
+{ "nonce": "<string>" }
+```
+
+Headers (required):
+- `X-Printer-Timestamp`: unix time (seconds)
+- `X-Printer-Signature`: HMAC-SHA256 hex of `"{timestamp}.{nonce}"` using `PRINTER_SHARED_SECRET`
+
+Response:
+```json
+{ "success": true }
 ```
 
 ### GET `/status`

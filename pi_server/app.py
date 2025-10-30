@@ -175,6 +175,48 @@ def index():
         'status': 'running'
     }), 200
 
+@app.route('/verify', methods=['POST'])
+def verify():
+    """Signed verification endpoint to confirm shared-secret pairing without printing.
+
+    Expects JSON payload: { 'nonce': '<string>' }
+    Requires headers when PRINTER_SHARED_SECRET is set:
+      - X-Printer-Timestamp: unix epoch seconds
+      - X-Printer-Signature: HMAC-SHA256 hex of f"{timestamp}.{nonce}" with PRINTER_SHARED_SECRET
+    """
+    try:
+        # If no secret configured (testing), accept
+        if not PRINTER_SHARED_SECRET:
+            return jsonify({'success': True, 'message': 'Unsigned mode'}), 200
+
+        data = request.get_json() or {}
+        nonce = str(data.get('nonce', ''))
+
+        signature = request.headers.get('X-Printer-Signature')
+        timestamp_header = request.headers.get('X-Printer-Timestamp')
+
+        if not signature or not timestamp_header:
+            return jsonify({'success': False, 'message': 'Missing signature headers'}), 401
+
+        try:
+            timestamp = int(timestamp_header)
+        except ValueError:
+            return jsonify({'success': False, 'message': 'Invalid timestamp header'}), 401
+
+        current_time = int(time.time())
+        if SIGNATURE_MAX_AGE and abs(current_time - timestamp) > SIGNATURE_MAX_AGE:
+            return jsonify({'success': False, 'message': 'Signature expired'}), 401
+
+        payload = f"{timestamp_header}.{nonce}".encode('utf-8')
+        expected = hmac.new(PRINTER_SHARED_SECRET.encode('utf-8'), payload, hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(expected, signature):
+            return jsonify({'success': False, 'message': 'Invalid signature'}), 401
+
+        return jsonify({'success': True, 'message': 'Verified'}), 200
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Error: {e}'}), 500
+
 def verify_request_signature(request, escpos_b64: str):
     """Verify HMAC signature from the bot server if a shared secret is configured."""
     if not PRINTER_SHARED_SECRET:

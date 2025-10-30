@@ -5,6 +5,8 @@ This module handles communication with the actual printer hardware
 
 import os
 import time
+import configparser
+from pathlib import Path
 
 
 class PrinterHandler:
@@ -15,6 +17,7 @@ class PrinterHandler:
         self.printer_connected = False
         self.write_chunk_size = self._load_chunk_size()
         self.write_chunk_delay = self._load_chunk_delay()
+        self.config = self._load_config()
         self._initialize_printer()
     
     def _initialize_printer(self):
@@ -23,49 +26,52 @@ class PrinterHandler:
             # Import python-escpos library
             from escpos.printer import Usb, Network, Serial
             
-            # Try to connect to printer
-            # Option 1: USB connection (most common)
-            try:
-                # TM-T88IV USB vendor and product IDs
-                # These may need to be adjusted based on your specific model
-                # Use keyword args so timeout stays unlimited and endpoints are correct.
-                self.printer = Usb(
-                    0x04B8,
-                    0x0202,
-                    timeout=0,
-                    in_ep=0x82,
-                    out_ep=0x01,
-                )
-                self.printer_connected = True
-                print("Printer connected via USB")
-                self.test_print()
-                return
-            except Exception as e:
-                print(f"USB connection failed: {e}")
-            
-            # Option 2: Network connection
-            try:
-                # If printer has network interface
-                # Adjust IP address as needed
-                import os
-                printer_ip = os.getenv('PRINTER_IP', '192.168.1.100')
-                self.printer = Network(printer_ip)
-                self.printer_connected = True
-                print(f"Printer connected via Network at {printer_ip}")
-                return
-            except Exception as e:
-                print(f"Network connection failed: {e}")
-            
-            # Option 3: Serial connection
-            try:
-                serial_port = os.getenv('PRINTER_SERIAL', '/dev/ttyUSB0')
-                self.printer = Serial(serial_port)
-                self.printer_connected = True
-                print(f"Printer connected via Serial at {serial_port}")
-                return
-            except Exception as e:
-                print(f"Serial connection failed: {e}")
-            
+            # Use config.ini if provided
+            connection = (self.config.get('printer', 'connection', fallback='usb') if self.config else 'usb').lower()
+            if connection == 'usb':
+                try:
+                    # Configurable USB IDs
+                    vid_str = self.config.get('printer', 'usb_vendor_id', fallback='') if self.config else ''
+                    pid_str = self.config.get('printer', 'usb_product_id', fallback='') if self.config else ''
+                    if not vid_str or not pid_str:
+                        detected = self.detect_printers_usb()
+                        if detected:
+                            vid, pid = detected[0]
+                        else:
+                            vid = 0x04B8
+                            pid = 0x0202
+                    else:
+                        vid = int(vid_str, 16) if isinstance(vid_str, str) and vid_str else 0x04B8
+                        pid = int(pid_str, 16) if isinstance(pid_str, str) and pid_str else 0x0202
+                    self.printer = Usb(vid, pid, timeout=0, in_ep=0x82, out_ep=0x01)
+                    self.printer_connected = True
+                    print(f"Printer connected via USB (VID=0x{vid:04X}, PID=0x{pid:04X})")
+                    self.test_print()
+                    return
+                except Exception as e:
+                    print(f"USB connection failed: {e}")
+                    # fallthrough to try others
+            if connection == 'network':
+                try:
+                    printer_ip = self.config.get('printer', 'ip', fallback=os.getenv('PRINTER_IP', '')) if self.config else os.getenv('PRINTER_IP', '')
+                    port = int(self.config.get('printer', 'port', fallback='9100')) if self.config else 9100
+                    self.printer = Network(printer_ip, port=port)
+                    self.printer_connected = True
+                    print(f"Printer connected via Network at {printer_ip}:{port}")
+                    return
+                except Exception as e:
+                    print(f"Network connection failed: {e}")
+            if connection == 'serial':
+                try:
+                    serial_port = self.config.get('printer', 'device', fallback=os.getenv('PRINTER_SERIAL', '/dev/ttyUSB0')) if self.config else os.getenv('PRINTER_SERIAL', '/dev/ttyUSB0')
+                    baudrate = int(self.config.get('printer', 'baudrate', fallback='19200')) if self.config else 19200
+                    self.printer = Serial(serial_port, baudrate=baudrate)
+                    self.printer_connected = True
+                    print(f"Printer connected via Serial at {serial_port} (baud {baudrate})")
+                    return
+                except Exception as e:
+                    print(f"Serial connection failed: {e}")
+
             print("WARNING: Could not connect to printer. All print jobs will fail.")
             self.printer_connected = False
         
@@ -73,6 +79,38 @@ class PrinterHandler:
             print("ERROR: python-escpos library not installed")
             print("Install with: pip install python-escpos")
             self.printer_connected = False
+
+    @staticmethod
+    def detect_printers_usb():
+        """Return a list of (vid, pid) for connected USB printers (best-effort)."""
+        devices = []
+        try:
+            import usb.core  # pyusb
+            for dev in usb.core.find(find_all=True):
+                vid = int(dev.idVendor)
+                pid = int(dev.idProduct)
+                # Prefer Epson (0x04B8) but include all
+                devices.append((vid, pid))
+            # Sort with Epson first
+            devices.sort(key=lambda vp: 0 if vp[0] == 0x04B8 else 1)
+        except Exception:
+            pass
+        if not devices and os.name == 'nt':
+            print("Windows: If using TM-T88IV, install libusbK driver via Zadig and retry.")
+        return devices
+
+    @staticmethod
+    def _load_config():
+        """Load optional config.ini for printer connection settings."""
+        try:
+            cfg_path = Path(__file__).resolve().parents[1] / 'config.ini'
+            if not cfg_path.exists():
+                return None
+            cfg = configparser.ConfigParser()
+            cfg.read(cfg_path)
+            return cfg
+        except Exception:
+            return None
     
     def print_escpos(self, escpos_data):
         """
