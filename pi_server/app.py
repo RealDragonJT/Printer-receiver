@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 # Import handlers
 from pi_server.simulator import PrintSimulator
 from pi_server.printer_handler import PrinterHandler
+from pi_server.job_queue import get_queue
 
 # Load environment variables
 load_dotenv()
@@ -18,7 +19,7 @@ load_dotenv()
 app = Flask(__name__)
 
 # Configuration
-TESTING_MODE = os.getenv('TESTING_MODE', 'true').lower() == 'true'
+TESTING_MODE = os.getenv('TESTING_MODE', 'false').lower() == 'true'
 LOG_DIR = Path('print_logs')
 LOG_DIR.mkdir(exist_ok=True)
 PRINTER_SHARED_SECRET = os.getenv('PRINTER_SHARED_SECRET', '').strip()
@@ -109,17 +110,53 @@ def print_job():
             result = printer.print_escpos(escpos_data)
             
             if result['success']:
+                # Successful print - clear any queued jobs since paper is available
+                queue = get_queue()
+                queued_count = queue.queue_size()
+                if queued_count > 0:
+                    print(f"[App] Print successful - cleared {queued_count} queued job(s)")
+                    queue.clear_queue()
+                
                 return jsonify({
                     'success': True,
                     'message': 'Print job sent to printer'
                 }), 200
             else:
                 error_code = result.get('error_code', 'PRINTER_ERROR')
-                return jsonify({
-                    'success': False,
-                    'message': result.get('message', 'Printer error'),
-                    'error_code': error_code
-                }), 503
+                
+                # If paper out, queue the job instead of failing
+                if error_code == 'OUT_OF_PAPER':
+                    queue = get_queue()
+                    queue.add_job({
+                        'escpos_data': escpos_b64,
+                        'username': username,
+                        'user_id': user_id,
+                        'queued_at': datetime.utcnow().isoformat()
+                    })
+                    
+                    queue_count = queue.queue_size()
+                    
+                    # Start periodic checking if not already running
+                    if not queue.running:
+                        queue.start_periodic_check(
+                            check_paper_func=lambda: printer.check_paper_status(),
+                            print_func=lambda data: printer.print_escpos(base64.b64decode(data))
+                        )
+                    
+                    return jsonify({
+                        'success': False,
+                        'message': f'Printer is out of paper or cover is open. Your print will be queued and printed automatically once paper is inserted ({queue_count} job(s) in queue).',
+                        'error_code': error_code,
+                        'queued': True,
+                        'queue_size': queue_count
+                    }), 503
+                else:
+                    # Other errors - return normally
+                    return jsonify({
+                        'success': False,
+                        'message': result.get('message', 'Printer error'),
+                        'error_code': error_code
+                    }), 503
     
     except Exception as e:
         print(f"Error processing print job: {e}")
@@ -252,6 +289,16 @@ def main():
     
     print(f"Starting Discord Printer API on {host}:{port}")
     print(f"Mode: {'TESTING' if TESTING_MODE else 'PRODUCTION'}")
+    
+    # Initialize queue and start periodic checking if jobs are queued
+    if not TESTING_MODE:
+        queue = get_queue()
+        if queue.queue_size() > 0:
+            print(f"[App] Found {queue.queue_size()} queued job(s) - starting periodic paper check")
+            queue.start_periodic_check(
+                check_paper_func=lambda: printer.check_paper_status(),
+                print_func=lambda data: printer.print_escpos(base64.b64decode(data))
+            )
     
     app.run(host=host, port=port, debug=False)
 

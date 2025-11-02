@@ -40,6 +40,7 @@ print_logs/
 *.swp
 *.swo
 .cursor/*
+.workspace/*
 # OS
 .DS_Store
 Thumbs.db

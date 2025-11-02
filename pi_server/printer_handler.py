@@ -6,6 +6,7 @@ This module handles communication with the actual printer hardware
 import os
 import time
 import configparser
+import threading
 from pathlib import Path
 
 
@@ -43,7 +44,8 @@ class PrinterHandler:
                     else:
                         vid = int(vid_str, 16) if isinstance(vid_str, str) and vid_str else 0x04B8
                         pid = int(pid_str, 16) if isinstance(pid_str, str) and pid_str else 0x0202
-                    self.printer = Usb(vid, pid, timeout=0, in_ep=0x82, out_ep=0x01)
+                    # Use timeout=5 for USB operations to prevent hanging when cover is open
+                    self.printer = Usb(vid, pid, timeout=5, in_ep=0x82, out_ep=0x01)
                     self.printer_connected = True
                     print(f"Printer connected via USB (VID=0x{vid:04X}, PID=0x{pid:04X})")
                     self.test_print()
@@ -112,6 +114,143 @@ class PrinterHandler:
         except Exception:
             return None
     
+    def _feed_with_timeout(self, timeout_seconds=2):
+        """
+        Try feed command with timeout and verification
+        
+        Returns:
+            (success, error) tuple
+        """
+        feed_result = {'success': False, 'error': None, 'completed': False, 'started': False}
+        feed_exception = [None]  # Use list to allow modification in nested function
+        
+        def feed_operation():
+            try:
+                feed_result['started'] = True
+                # ESC J n (feed n dot lines) - feed minimal amount for speed
+                feed_cmd = b"\x1b\x4a\x02"  # Feed 2 dot lines (minimal)
+                self.printer._raw(feed_cmd)
+                time.sleep(0.1)  # Short wait
+                
+                feed_result['success'] = True
+                feed_result['completed'] = True
+            except Exception as e:
+                feed_exception[0] = e
+                feed_result['error'] = str(e)
+                feed_result['completed'] = True
+        
+        # Run feed in a separate thread with timeout
+        feed_thread = threading.Thread(target=feed_operation, name="FeedTestThread")
+        feed_thread.daemon = True
+        start_time = time.time()
+        feed_thread.start()
+        feed_thread.join(timeout=timeout_seconds)
+        
+        if feed_thread.is_alive():
+            # Thread is still running = timeout occurred
+            return False, f"Feed timeout after {timeout_seconds}s"
+        
+        if not feed_result.get('started', False):
+            return False, "Feed operation didn't start"
+        
+        if not feed_result['completed']:
+            return False, "Feed command didn't complete"
+        
+        if feed_result['error']:
+            return False, feed_result['error']
+        
+        if feed_result['success']:
+            return True, None
+        
+        return False, "Unknown feed error"
+    
+    def _read_status_byte(self, timeout_ms=800):
+        """Try to read printer status byte via USB with timeout"""
+        status_result = {'value': None, 'error': None}
+        
+        def read_operation():
+            try:
+                if hasattr(self.printer, 'device') and hasattr(self.printer, 'in_ep'):
+                    import usb.core
+                    dev = self.printer.device
+                    IN_EP = self.printer.in_ep
+                    
+                    # Request status
+                    self.printer._raw(b"\x10\x04")  # DLE EOT
+                    time.sleep(0.15)  # Shorter wait
+                    
+                    # Try to read response with timeout
+                    try:
+                        resp = dev.read(IN_EP, 64, timeout=timeout_ms)
+                        if resp and len(resp) > 0:
+                            status_result['value'] = resp[0]
+                    except usb.core.USBError as e:
+                        # USB read timeout/error - printer might not respond
+                        status_result['error'] = str(e)
+            except Exception as e:
+                status_result['error'] = str(e)
+        
+        # Run status read in a separate thread with timeout
+        read_thread = threading.Thread(target=read_operation)
+        read_thread.daemon = True
+        read_thread.start()
+        read_thread.join(timeout=(timeout_ms / 1000.0) + 0.5)  # Thread timeout slightly longer than USB timeout
+        
+        if read_thread.is_alive():
+            return None
+        
+        if status_result['error']:
+            return None
+        
+        return status_result['value']
+    
+    def check_paper_status(self):
+        """
+        Check printer paper status using feed test and status byte verification
+        
+        Returns:
+            dict with 'paper_ok' boolean and 'error_code' if paper is out
+        """
+        if not self.printer_connected or self.printer is None:
+            return {'paper_ok': False, 'error_code': 'NO_PRINTER'}
+        
+        try:
+            # First, try to get status byte before feed
+            status_before = self._read_status_byte(timeout_ms=500)
+            if status_before is not None:
+                paper_end_before = bool(status_before & 0x08)
+                cover_open_before = bool(status_before & 0x20)
+                if paper_end_before or cover_open_before:
+                    return {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
+            
+            # Try feed with 2 second timeout
+            try:
+                feed_success, feed_error = self._feed_with_timeout(timeout_seconds=2)
+            except Exception as feed_ex:
+                feed_success, feed_error = False, str(feed_ex)
+            
+            # Check status after feed
+            time.sleep(0.2)
+            status_after = self._read_status_byte(timeout_ms=500)
+            
+            if status_after is not None:
+                paper_end = bool(status_after & 0x08)
+                cover_open = bool(status_after & 0x20)
+                if paper_end or cover_open:
+                    return {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
+                else:
+                    return {'paper_ok': True}
+            
+            # Fall back to feed result if status read fails
+            if feed_success:
+                return {'paper_ok': True}
+            else:
+                return {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
+                
+        except Exception as e:
+            # If check fails, assume paper out to be safe
+            return {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
+    
     def print_escpos(self, escpos_data):
         """
         Send ESC/POS commands directly to the printer
@@ -131,6 +270,20 @@ class PrinterHandler:
                 'success': False,
                 'message': 'Printer not connected',
                 'error_code': 'NO_PRINTER'
+            }
+        
+        # Check paper status before printing
+        try:
+            paper_status = self.check_paper_status()
+        except Exception as e:
+            # If check fails, assume paper out to prevent printing and queue the job
+            paper_status = {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
+        
+        if not paper_status.get('paper_ok', True):
+            return {
+                'success': False,
+                'message': 'Printer is out of paper or cover is open',
+                'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
             }
         
         try:
@@ -164,25 +317,40 @@ class PrinterHandler:
                         time.sleep(current_delay)
                 except Exception as exc:
                     error_text = str(exc).lower()
+                    error_type = type(exc).__name__
                     
+                    # After any error, check paper status
+                    paper_status = self.check_paper_status()
+                    if not paper_status.get('paper_ok', True):
+                        return {
+                            'success': False,
+                            'message': 'Printer is out of paper or cover is open',
+                            'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
+                        }
+                    
+                    # If printer is connected but times out, likely paper out
+                    if 'timeout' in error_text and self.printer_connected:
+                        return {
+                            'success': False,
+                            'message': 'Printer is out of paper or cover is open',
+                            'error_code': 'OUT_OF_PAPER'
+                        }
+                    
+                    # Only retry/reduce chunk size if not connected (connection issue)
                     if 'timeout' in error_text and current_chunk_size > min_chunk_size:
-                        # Reduce chunk size and retry same block.
                         current_chunk_size = max(min_chunk_size, current_chunk_size // 2)
                         current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
-                        print(f"USB timeout detected. Reducing chunk size to {current_chunk_size} bytes.")
                         time.sleep(0.1)
                         continue
                     
-                    # Attempt to reinitialize printer once on timeout errors.
-                    if 'timeout' in error_text:
-                        if not reinitialized_once:
-                            print("USB timeout persists; reinitializing printer connection.")
-                            self._initialize_printer()
-                            reinitialized_once = True
-                            if not self.printer_connected or self.printer is None:
-                                raise
-                            time.sleep(0.2)
-                            continue
+                    # Attempt to reinitialize printer once on timeout errors
+                    if 'timeout' in error_text and not reinitialized_once:
+                        self._initialize_printer()
+                        reinitialized_once = True
+                        if not self.printer_connected or self.printer is None:
+                            raise
+                        time.sleep(0.2)
+                        continue
                     
                     raise
             
@@ -192,27 +360,61 @@ class PrinterHandler:
             }
         
         except Exception as e:
-            error_msg = str(e).lower()
+            error_msg = str(e)
+            error_msg_lower = error_msg.lower()
+            error_type = type(e).__name__
+            full_error = f"{error_msg_lower} {error_type.lower()}"
             
-            # Detect specific error types
-            if 'paper' in error_msg or 'cover' in error_msg:
+            # After exception, check paper status one more time
+            paper_status = self.check_paper_status()
+            if not paper_status.get('paper_ok', True):
+                return {
+                    'success': False,
+                    'message': 'Printer is out of paper or cover is open',
+                    'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
+                }
+            
+            # Detect offline/connection errors first
+            offline_keywords = ['offline', 'not responding', 'unreachable', 'connection refused', 'connection reset']
+            if any(keyword in error_msg_lower for keyword in offline_keywords):
+                return {
+                    'success': False,
+                    'message': 'Printer is offline or unreachable',
+                    'error_code': 'PRINTER_OFFLINE'
+                }
+            
+            # Detect specific paper-related keywords
+            paper_keywords = ['paper', 'cover', 'empty', 'roll', 'sensor', 'feed', 'end']
+            if any(keyword in full_error for keyword in paper_keywords):
                 return {
                     'success': False,
                     'message': 'Printer is out of paper or cover is open',
                     'error_code': 'OUT_OF_PAPER'
                 }
-            elif 'offline' in error_msg or 'not responding' in error_msg:
+            
+            # If printer is connected but we get an error, assume it's likely paper out
+            if self.printer_connected:
+                usb_error_patterns = ['usb', 'libusb', 'device', 'i/o', 'broken pipe', 'bad file descriptor', 'timeout']
+                if any(pattern in full_error for pattern in usb_error_patterns):
+                    return {
+                        'success': False,
+                        'message': 'Printer is out of paper or cover is open',
+                        'error_code': 'OUT_OF_PAPER'
+                    }
+                
+                # Default to paper out for connected printer failures
                 return {
                     'success': False,
-                    'message': 'Printer is offline',
-                    'error_code': 'PRINTER_OFFLINE'
+                    'message': 'Printer is out of paper or cover is open',
+                    'error_code': 'OUT_OF_PAPER'
                 }
-            else:
-                return {
-                    'success': False,
-                    'message': f'Printer error: {str(e)}',
-                    'error_code': 'PRINTER_ERROR'
-                }
+            
+            # Printer not connected or other error
+            return {
+                'success': False,
+                'message': f'Printer error: {error_msg}',
+                'error_code': 'PRINTER_ERROR'
+            }
     
     def get_status(self):
         """
