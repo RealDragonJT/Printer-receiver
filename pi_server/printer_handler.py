@@ -273,22 +273,29 @@ class PrinterHandler:
                 'error_code': 'NO_PRINTER'
             }
         
+        # Check paper status before acquiring lock (fast fail if paper out)
+        try:
+            paper_status = self.check_paper_status()
+            print(f"[PrinterHandler] Paper status check result: {paper_status}")
+        except Exception as e:
+            # If check fails, assume paper out to prevent printing and queue the job
+            print(f"[PrinterHandler] Paper status check exception: {e}")
+            import traceback
+            traceback.print_exc()
+            paper_status = {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
+        
+        if not paper_status.get('paper_ok', True):
+            print(f"[PrinterHandler] Paper check failed, returning OUT_OF_PAPER error")
+            return {
+                'success': False,
+                'message': 'Printer is out of paper or cover is open',
+                'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
+            }
+        
+        print(f"[PrinterHandler] Paper check passed, acquiring lock and printing...")
+        
         # Acquire lock to prevent concurrent print jobs (prevents ESC/POS command corruption)
         with self.print_lock:
-            # Check paper status before printing
-            try:
-                paper_status = self.check_paper_status()
-            except Exception as e:
-                # If check fails, assume paper out to prevent printing and queue the job
-                paper_status = {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
-            
-            if not paper_status.get('paper_ok', True):
-                return {
-                    'success': False,
-                    'message': 'Printer is out of paper or cover is open',
-                    'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
-                }
-            
             try:
                 # Send raw ESC/POS data to printer
                 if not escpos_data:
@@ -357,6 +364,7 @@ class PrinterHandler:
                         
                         raise
                 
+                print(f"[PrinterHandler] Print job completed successfully")
                 return {
                     'success': True,
                     'message': 'Print job sent successfully'
