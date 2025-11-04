@@ -19,6 +19,7 @@ class PrinterHandler:
         self.write_chunk_size = self._load_chunk_size()
         self.write_chunk_delay = self._load_chunk_delay()
         self.config = self._load_config()
+        self.print_lock = threading.Lock()  # Lock to prevent concurrent print jobs
         self._initialize_printer()
     
     def _initialize_printer(self):
@@ -272,101 +273,15 @@ class PrinterHandler:
                 'error_code': 'NO_PRINTER'
             }
         
-        # Check paper status before printing
-        try:
-            paper_status = self.check_paper_status()
-        except Exception as e:
-            # If check fails, assume paper out to prevent printing and queue the job
-            paper_status = {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
-        
-        if not paper_status.get('paper_ok', True):
-            return {
-                'success': False,
-                'message': 'Printer is out of paper or cover is open',
-                'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
-            }
-        
-        try:
-            # Send raw ESC/POS data to printer
-            if not escpos_data:
-                return {
-                    'success': True,
-                    'message': 'No data to print'
-                }
+        # Acquire lock to prevent concurrent print jobs (prevents ESC/POS command corruption)
+        with self.print_lock:
+            # Check paper status before printing
+            try:
+                paper_status = self.check_paper_status()
+            except Exception as e:
+                # If check fails, assume paper out to prevent printing and queue the job
+                paper_status = {'paper_ok': False, 'error_code': 'OUT_OF_PAPER'}
             
-            if isinstance(escpos_data, (bytes, bytearray, memoryview)):
-                data = bytes(escpos_data)
-            else:
-                raise TypeError("ESC/POS data must be bytes-like")
-            
-            current_chunk_size = self.write_chunk_size
-            current_delay = self.write_chunk_delay
-            min_chunk_size = 64 if os.name == 'nt' else 256
-            index = 0
-            reinitialized_once = False
-            
-            while index < len(data):
-                chunk_len = min(current_chunk_size, len(data) - index)
-                chunk = data[index:index + chunk_len]
-                
-                try:
-                    # Split large payloads to prevent USB timeouts on Windows/libusb.
-                    self.printer._raw(chunk)
-                    index += chunk_len
-                    if current_delay:
-                        time.sleep(current_delay)
-                except Exception as exc:
-                    error_text = str(exc).lower()
-                    error_type = type(exc).__name__
-                    
-                    # After any error, check paper status
-                    paper_status = self.check_paper_status()
-                    if not paper_status.get('paper_ok', True):
-                        return {
-                            'success': False,
-                            'message': 'Printer is out of paper or cover is open',
-                            'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
-                        }
-                    
-                    # If printer is connected but times out, likely paper out
-                    if 'timeout' in error_text and self.printer_connected:
-                        return {
-                            'success': False,
-                            'message': 'Printer is out of paper or cover is open',
-                            'error_code': 'OUT_OF_PAPER'
-                        }
-                    
-                    # Only retry/reduce chunk size if not connected (connection issue)
-                    if 'timeout' in error_text and current_chunk_size > min_chunk_size:
-                        current_chunk_size = max(min_chunk_size, current_chunk_size // 2)
-                        current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
-                        time.sleep(0.1)
-                        continue
-                    
-                    # Attempt to reinitialize printer once on timeout errors
-                    if 'timeout' in error_text and not reinitialized_once:
-                        self._initialize_printer()
-                        reinitialized_once = True
-                        if not self.printer_connected or self.printer is None:
-                            raise
-                        time.sleep(0.2)
-                        continue
-                    
-                    raise
-            
-            return {
-                'success': True,
-                'message': 'Print job sent successfully'
-            }
-        
-        except Exception as e:
-            error_msg = str(e)
-            error_msg_lower = error_msg.lower()
-            error_type = type(e).__name__
-            full_error = f"{error_msg_lower} {error_type.lower()}"
-            
-            # After exception, check paper status one more time
-            paper_status = self.check_paper_status()
             if not paper_status.get('paper_ok', True):
                 return {
                     'success': False,
@@ -374,47 +289,136 @@ class PrinterHandler:
                     'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
                 }
             
-            # Detect offline/connection errors first
-            offline_keywords = ['offline', 'not responding', 'unreachable', 'connection refused', 'connection reset']
-            if any(keyword in error_msg_lower for keyword in offline_keywords):
+            try:
+                # Send raw ESC/POS data to printer
+                if not escpos_data:
+                    return {
+                        'success': True,
+                        'message': 'No data to print'
+                    }
+                
+                if isinstance(escpos_data, (bytes, bytearray, memoryview)):
+                    data = bytes(escpos_data)
+                else:
+                    raise TypeError("ESC/POS data must be bytes-like")
+                
+                current_chunk_size = self.write_chunk_size
+                current_delay = self.write_chunk_delay
+                min_chunk_size = 64 if os.name == 'nt' else 256
+                index = 0
+                reinitialized_once = False
+                
+                while index < len(data):
+                    chunk_len = min(current_chunk_size, len(data) - index)
+                    chunk = data[index:index + chunk_len]
+                    
+                    try:
+                        # Split large payloads to prevent USB timeouts on Windows/libusb.
+                        self.printer._raw(chunk)
+                        index += chunk_len
+                        if current_delay:
+                            time.sleep(current_delay)
+                    except Exception as exc:
+                        error_text = str(exc).lower()
+                        error_type = type(exc).__name__
+                        
+                        # After any error, check paper status
+                        paper_status = self.check_paper_status()
+                        if not paper_status.get('paper_ok', True):
+                            return {
+                                'success': False,
+                                'message': 'Printer is out of paper or cover is open',
+                                'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
+                            }
+                        
+                        # If printer is connected but times out, likely paper out
+                        if 'timeout' in error_text and self.printer_connected:
+                            return {
+                                'success': False,
+                                'message': 'Printer is out of paper or cover is open',
+                                'error_code': 'OUT_OF_PAPER'
+                            }
+                        
+                        # Only retry/reduce chunk size if not connected (connection issue)
+                        if 'timeout' in error_text and current_chunk_size > min_chunk_size:
+                            current_chunk_size = max(min_chunk_size, current_chunk_size // 2)
+                            current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
+                            time.sleep(0.1)
+                            continue
+                        
+                        # Attempt to reinitialize printer once on timeout errors
+                        if 'timeout' in error_text and not reinitialized_once:
+                            self._initialize_printer()
+                            reinitialized_once = True
+                            if not self.printer_connected or self.printer is None:
+                                raise
+                            time.sleep(0.2)
+                            continue
+                        
+                        raise
+                
                 return {
-                    'success': False,
-                    'message': 'Printer is offline or unreachable',
-                    'error_code': 'PRINTER_OFFLINE'
+                    'success': True,
+                    'message': 'Print job sent successfully'
                 }
             
-            # Detect specific paper-related keywords
-            paper_keywords = ['paper', 'cover', 'empty', 'roll', 'sensor', 'feed', 'end']
-            if any(keyword in full_error for keyword in paper_keywords):
-                return {
-                    'success': False,
-                    'message': 'Printer is out of paper or cover is open',
-                    'error_code': 'OUT_OF_PAPER'
-                }
-            
-            # If printer is connected but we get an error, assume it's likely paper out
-            if self.printer_connected:
-                usb_error_patterns = ['usb', 'libusb', 'device', 'i/o', 'broken pipe', 'bad file descriptor', 'timeout']
-                if any(pattern in full_error for pattern in usb_error_patterns):
+            except Exception as e:
+                error_msg = str(e)
+                error_msg_lower = error_msg.lower()
+                error_type = type(e).__name__
+                full_error = f"{error_msg_lower} {error_type.lower()}"
+                
+                # After exception, check paper status one more time
+                paper_status = self.check_paper_status()
+                if not paper_status.get('paper_ok', True):
+                    return {
+                        'success': False,
+                        'message': 'Printer is out of paper or cover is open',
+                        'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
+                    }
+                
+                # Detect offline/connection errors first
+                offline_keywords = ['offline', 'not responding', 'unreachable', 'connection refused', 'connection reset']
+                if any(keyword in error_msg_lower for keyword in offline_keywords):
+                    return {
+                        'success': False,
+                        'message': 'Printer is offline or unreachable',
+                        'error_code': 'PRINTER_OFFLINE'
+                    }
+                
+                # Detect specific paper-related keywords
+                paper_keywords = ['paper', 'cover', 'empty', 'roll', 'sensor', 'feed', 'end']
+                if any(keyword in full_error for keyword in paper_keywords):
                     return {
                         'success': False,
                         'message': 'Printer is out of paper or cover is open',
                         'error_code': 'OUT_OF_PAPER'
                     }
                 
-                # Default to paper out for connected printer failures
+                # If printer is connected but we get an error, assume it's likely paper out
+                if self.printer_connected:
+                    usb_error_patterns = ['usb', 'libusb', 'device', 'i/o', 'broken pipe', 'bad file descriptor', 'timeout']
+                    if any(pattern in full_error for pattern in usb_error_patterns):
+                        return {
+                            'success': False,
+                            'message': 'Printer is out of paper or cover is open',
+                            'error_code': 'OUT_OF_PAPER'
+                        }
+                    
+                    # Default to paper out for connected printer failures
+                    return {
+                        'success': False,
+                        'message': 'Printer is out of paper or cover is open',
+                        'error_code': 'OUT_OF_PAPER'
+                    }
+                
+                # Printer not connected or other error
                 return {
                     'success': False,
-                    'message': 'Printer is out of paper or cover is open',
-                    'error_code': 'OUT_OF_PAPER'
+                    'message': f'Printer error: {error_msg}',
+                    'error_code': 'PRINTER_ERROR'
                 }
-            
-            # Printer not connected or other error
-            return {
-                'success': False,
-                'message': f'Printer error: {error_msg}',
-                'error_code': 'PRINTER_ERROR'
-            }
+        # Lock is automatically released here
     
     def get_status(self):
         """
