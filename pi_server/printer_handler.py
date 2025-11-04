@@ -329,17 +329,10 @@ class PrinterHandler:
                         error_text = str(exc).lower()
                         error_type = type(exc).__name__
                         
-                        # After any error, check paper status
-                        paper_status = self.check_paper_status()
-                        if not paper_status.get('paper_ok', True):
-                            return {
-                                'success': False,
-                                'message': 'Printer is out of paper or cover is open',
-                                'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
-                            }
-                        
                         # If printer is connected but times out, likely paper out
+                        # Don't check paper status here (inside lock) as it uses threading
                         if 'timeout' in error_text and self.printer_connected:
+                            print(f"[PrinterHandler] Timeout error during print: {error_text}")
                             return {
                                 'success': False,
                                 'message': 'Printer is out of paper or cover is open',
@@ -376,14 +369,12 @@ class PrinterHandler:
                 error_type = type(e).__name__
                 full_error = f"{error_msg_lower} {error_type.lower()}"
                 
-                # After exception, check paper status one more time
-                paper_status = self.check_paper_status()
-                if not paper_status.get('paper_ok', True):
-                    return {
-                        'success': False,
-                        'message': 'Printer is out of paper or cover is open',
-                        'error_code': paper_status.get('error_code', 'OUT_OF_PAPER')
-                    }
+                print(f"[PrinterHandler] Exception during print: {error_msg} ({error_type})")
+                import traceback
+                traceback.print_exc()
+                
+                # Don't check paper status here (inside lock) as it uses threading
+                # Instead, use error message patterns to detect paper out
                 
                 # Detect offline/connection errors first
                 offline_keywords = ['offline', 'not responding', 'unreachable', 'connection refused', 'connection reset']
@@ -394,8 +385,8 @@ class PrinterHandler:
                         'error_code': 'PRINTER_OFFLINE'
                     }
                 
-                # Detect specific paper-related keywords
-                paper_keywords = ['paper', 'cover', 'empty', 'roll', 'sensor', 'feed', 'end']
+                # Detect specific paper-related keywords (be more conservative)
+                paper_keywords = ['paper end', 'cover open', 'paper empty', 'roll empty', 'paper sensor']
                 if any(keyword in full_error for keyword in paper_keywords):
                     return {
                         'success': False,
@@ -403,21 +394,30 @@ class PrinterHandler:
                         'error_code': 'OUT_OF_PAPER'
                     }
                 
-                # If printer is connected but we get an error, assume it's likely paper out
+                # For USB errors, be more specific - only timeout might indicate paper out
                 if self.printer_connected:
-                    usb_error_patterns = ['usb', 'libusb', 'device', 'i/o', 'broken pipe', 'bad file descriptor', 'timeout']
-                    if any(pattern in full_error for pattern in usb_error_patterns):
+                    # Only timeout errors are likely paper out, other USB errors might be different issues
+                    if 'timeout' in error_msg_lower:
                         return {
                             'success': False,
                             'message': 'Printer is out of paper or cover is open',
                             'error_code': 'OUT_OF_PAPER'
                         }
                     
-                    # Default to paper out for connected printer failures
+                    # For other USB errors, return generic error instead of assuming paper out
+                    usb_error_patterns = ['usb', 'libusb', 'device', 'i/o', 'broken pipe', 'bad file descriptor']
+                    if any(pattern in full_error for pattern in usb_error_patterns):
+                        return {
+                            'success': False,
+                            'message': f'Printer communication error: {error_msg}',
+                            'error_code': 'PRINTER_ERROR'
+                        }
+                    
+                    # Default to generic error instead of assuming paper out
                     return {
                         'success': False,
-                        'message': 'Printer is out of paper or cover is open',
-                        'error_code': 'OUT_OF_PAPER'
+                        'message': f'Printer error: {error_msg}',
+                        'error_code': 'PRINTER_ERROR'
                     }
                 
                 # Printer not connected or other error
