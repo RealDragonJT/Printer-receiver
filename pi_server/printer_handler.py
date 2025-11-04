@@ -328,33 +328,48 @@ class PrinterHandler:
                     except Exception as exc:
                         error_text = str(exc).lower()
                         error_type = type(exc).__name__
+                        error_str = str(exc)
                         
-                        # If printer is connected but times out, likely paper out
-                        # Don't check paper status here (inside lock) as it uses threading
+                        print(f"[PrinterHandler] Error during chunk write: {error_str} ({error_type})")
+                        
+                        # USB timeout errors can be transient - try retry first before assuming paper out
                         if 'timeout' in error_text and self.printer_connected:
-                            print(f"[PrinterHandler] Timeout error during print: {error_text}")
+                            # First, try reducing chunk size and retrying
+                            if current_chunk_size > min_chunk_size:
+                                print(f"[PrinterHandler] Timeout error, reducing chunk size from {current_chunk_size} to {max(min_chunk_size, current_chunk_size // 2)}")
+                                current_chunk_size = max(min_chunk_size, current_chunk_size // 2)
+                                current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
+                                time.sleep(0.2)  # Wait a bit longer before retry
+                                continue
+                            
+                            # If we've already reduced chunk size, try reinitializing
+                            if not reinitialized_once:
+                                print(f"[PrinterHandler] Timeout persists, reinitializing printer connection")
+                                try:
+                                    self._initialize_printer()
+                                    reinitialized_once = True
+                                    if not self.printer_connected or self.printer is None:
+                                        raise
+                                    time.sleep(0.3)  # Wait after reinit
+                                    continue
+                                except Exception as reinit_exc:
+                                    print(f"[PrinterHandler] Reinitialization failed: {reinit_exc}")
+                                    # If reinit fails, likely paper out or hardware issue
+                                    return {
+                                        'success': False,
+                                        'message': 'Printer is out of paper or cover is open',
+                                        'error_code': 'OUT_OF_PAPER'
+                                    }
+                            
+                            # If we've tried everything, likely paper out
+                            print(f"[PrinterHandler] Timeout error persists after retries, assuming paper out")
                             return {
                                 'success': False,
                                 'message': 'Printer is out of paper or cover is open',
                                 'error_code': 'OUT_OF_PAPER'
                             }
                         
-                        # Only retry/reduce chunk size if not connected (connection issue)
-                        if 'timeout' in error_text and current_chunk_size > min_chunk_size:
-                            current_chunk_size = max(min_chunk_size, current_chunk_size // 2)
-                            current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
-                            time.sleep(0.1)
-                            continue
-                        
-                        # Attempt to reinitialize printer once on timeout errors
-                        if 'timeout' in error_text and not reinitialized_once:
-                            self._initialize_printer()
-                            reinitialized_once = True
-                            if not self.printer_connected or self.printer is None:
-                                raise
-                            time.sleep(0.2)
-                            continue
-                        
+                        # For non-timeout errors, re-raise to be handled by outer exception handler
                         raise
                 
                 print(f"[PrinterHandler] Print job completed successfully")
