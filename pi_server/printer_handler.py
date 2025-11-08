@@ -311,10 +311,9 @@ class PrinterHandler:
                 
                 current_chunk_size = self.write_chunk_size
                 current_delay = self.write_chunk_delay
-                min_chunk_size = 64 if os.name == 'nt' else 256
                 index = 0
                 reinitialized_once = False
-                
+
                 while index < len(data):
                     chunk_len = min(current_chunk_size, len(data) - index)
                     chunk = data[index:index + chunk_len]
@@ -334,15 +333,6 @@ class PrinterHandler:
                         
                         # USB timeout errors can be transient - try retry first before assuming paper out
                         if 'timeout' in error_text and self.printer_connected:
-                            # First, try reducing chunk size and retrying
-                            if current_chunk_size > min_chunk_size:
-                                print(f"[PrinterHandler] Timeout error, reducing chunk size from {current_chunk_size} to {max(min_chunk_size, current_chunk_size // 2)}")
-                                current_chunk_size = max(min_chunk_size, current_chunk_size // 2)
-                                current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
-                                time.sleep(0.2)  # Wait a bit longer before retry
-                                continue
-                            
-                            # If we've already reduced chunk size, try reinitializing
                             if not reinitialized_once:
                                 print(f"[PrinterHandler] Timeout persists, reinitializing printer connection")
                                 try:
@@ -350,6 +340,7 @@ class PrinterHandler:
                                     reinitialized_once = True
                                     if not self.printer_connected or self.printer is None:
                                         raise
+                                    current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
                                     time.sleep(0.3)  # Wait after reinit
                                     continue
                                 except Exception as reinit_exc:
@@ -501,12 +492,11 @@ class PrinterHandler:
     @staticmethod
     def _load_chunk_size():
         """Get chunk size for USB writes (env adjustable)."""
-        # Windows libusb implementations tend to time out on large writes,
-        # so use conservative defaults that can be overridden via env.
-        default_size = 128 if os.name == 'nt' else 2048
+        # Use conservative chunk size by default to avoid libusb timeouts.
+        default_size = 128
         try:
             value = int(os.getenv('PRINTER_WRITE_CHUNK_SIZE', default_size))
-            return max(256, min(8192, value))
+            return max(64, min(8192, value))
         except (TypeError, ValueError):
             return default_size
 

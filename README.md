@@ -108,7 +108,7 @@ python -m pi_server.app
 - `PRINTER_SIGNATURE_MAX_AGE` - Maximum age of request signatures in seconds (default: 300)
 
 **Advanced (USB optimization):**
-- `PRINTER_WRITE_CHUNK_SIZE` - Chunk size for USB writes (default: 128 on Windows, 2048 on Linux)
+- `PRINTER_WRITE_CHUNK_SIZE` - Chunk size for USB writes (default: 128)
 - `PRINTER_WRITE_CHUNK_DELAY` - Delay between chunks in seconds (default: 0.05 on Windows, 0.0 on Linux)
 
 ### Connection via config.ini
@@ -518,7 +518,6 @@ Root endpoint - service information.
 **Problem:** "USB timeout" errors during printing
 
 **Solutions:**
-- Reduce chunk size: `PRINTER_WRITE_CHUNK_SIZE=64`
 - Increase delay: `PRINTER_WRITE_CHUNK_DELAY=0.1`
 - Try different USB cable (some cables are data-only)
 - Check USB port power delivery (some ports may be underpowered)
