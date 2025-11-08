@@ -309,15 +309,42 @@ class PrinterHandler:
                 else:
                     raise TypeError("ESC/POS data must be bytes-like")
                 
+                # Check if data ends with feed/cut commands (common pattern: \n\n\n followed by GS V command)
+                # GS V 66 0 = b'\x1dV\x42\x00' (partial cut)
+                feed_cut_pattern = b'\x1dV\x42\x00'  # GS V 66 0
+                feed_newlines = b'\n\n\n'  # Common feed pattern
+                
+                # Try to detect and separate feed/cut commands
+                main_data = data
+                feed_cut_data = None
+                
+                # Look for the cut command near the end
+                cut_pos = data.rfind(feed_cut_pattern)
+                if cut_pos > 0 and cut_pos > len(data) - 20:  # Cut command in last 20 bytes
+                    # Check if there are newlines before the cut command
+                    before_cut = data[max(0, cut_pos - 10):cut_pos]
+                    if feed_newlines in before_cut or b'\n' * 2 in before_cut:
+                        # Separate feed/cut from main data
+                        # Find where feed commands start (look for newlines before cut)
+                        feed_start = cut_pos
+                        while feed_start > 0 and data[feed_start - 1:feed_start] == b'\n':
+                            feed_start -= 1
+                        # Include a few bytes before to catch any spacing
+                        feed_start = max(0, feed_start - 2)
+                        
+                        main_data = data[:feed_start]
+                        feed_cut_data = data[feed_start:]
+                        print(f"[PrinterHandler] Detected feed/cut commands, separating for reliable execution")
+                
                 current_chunk_size = self.write_chunk_size
                 current_delay = self.write_chunk_delay
-                min_chunk_size = 64  # Minimum chunk size for retry logic
                 index = 0
                 reinitialized_once = False
-                
-                while index < len(data):
-                    chunk_len = min(current_chunk_size, len(data) - index)
-                    chunk = data[index:index + chunk_len]
+
+                # Send main print data
+                while index < len(main_data):
+                    chunk_len = min(current_chunk_size, len(main_data) - index)
+                    chunk = main_data[index:index + chunk_len]
                     
                     try:
                         # Split large payloads to prevent USB timeouts on Windows/libusb.
@@ -334,15 +361,6 @@ class PrinterHandler:
                         
                         # USB timeout errors can be transient - try retry first before assuming paper out
                         if 'timeout' in error_text and self.printer_connected:
-                            # First, try reducing chunk size and retrying
-                            if current_chunk_size > min_chunk_size:
-                                print(f"[PrinterHandler] Timeout error, reducing chunk size from {current_chunk_size} to {max(min_chunk_size, current_chunk_size // 2)}")
-                                current_chunk_size = max(min_chunk_size, current_chunk_size // 2)
-                                current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
-                                time.sleep(0.2)  # Wait a bit longer before retry
-                                continue
-                            
-                            # If we've already reduced chunk size, try reinitializing
                             if not reinitialized_once:
                                 print(f"[PrinterHandler] Timeout persists, reinitializing printer connection")
                                 try:
@@ -350,6 +368,7 @@ class PrinterHandler:
                                     reinitialized_once = True
                                     if not self.printer_connected or self.printer is None:
                                         raise
+                                    current_delay = max(current_delay, 0.05 if os.name == 'nt' else 0.0)
                                     time.sleep(0.3)  # Wait after reinit
                                     continue
                                 except Exception as reinit_exc:
@@ -372,23 +391,42 @@ class PrinterHandler:
                         # For non-timeout errors, re-raise to be handled by outer exception handler
                         raise
                 
-                # Ensure all data is sent and printer processes the commands
-                # This is critical for feed/cut commands at the end of the ESC/POS sequence
-                try:
-                    if hasattr(self.printer, 'flush'):
-                        # Network/Serial printer with flush method
-                        self.printer.flush()
-                    elif hasattr(self.printer, 'device') and hasattr(self.printer, 'out_ep'):
-                        # USB printer - ensure write completes
-                        # USB endpoints don't have flush, but we can ensure the last write completes
-                        # by adding a small delay to allow the USB stack to send the data
-                        time.sleep(0.15)  # Slightly longer delay for USB to ensure buffer is sent
-                    else:
-                        # Fallback: delay to ensure buffer is sent
-                        time.sleep(0.15)
-                except Exception as flush_error:
-                    # Flush errors are non-critical, just log them
-                    print(f"[PrinterHandler] Flush warning (non-critical): {flush_error}")
+                # Wait for main print data to be processed before sending feed/cut
+                time.sleep(0.2)
+                
+                # Send feed/cut commands separately to ensure they execute immediately
+                if feed_cut_data:
+                    try:
+                        print(f"[PrinterHandler] Sending feed/cut commands separately")
+                        self.printer._raw(feed_cut_data)
+                        # Wait longer after feed/cut to ensure they're processed
+                        time.sleep(0.3)
+                        
+                        # For USB printers, try to force buffer flush by sending a status check
+                        # This helps ensure the feed/cut commands are processed
+                        if hasattr(self.printer, 'device') and hasattr(self.printer, 'out_ep'):
+                            try:
+                                # Send DLE EOT (status request) to force printer to process buffer
+                                self.printer._raw(b"\x10\x04")
+                                time.sleep(0.1)  # Brief wait for response
+                            except Exception:
+                                # Status check failure is non-critical
+                                pass
+                    except Exception as feed_cut_error:
+                        print(f"[PrinterHandler] Error sending feed/cut: {feed_cut_error}")
+                        # Don't fail the whole job if feed/cut fails, but log it
+                else:
+                    # If we didn't detect feed/cut, ensure buffer is flushed
+                    try:
+                        if hasattr(self.printer, 'flush'):
+                            # Network/Serial printer with flush method
+                            self.printer.flush()
+                        else:
+                            # USB printer - longer delay to ensure buffer is sent
+                            time.sleep(0.3)
+                    except Exception as flush_error:
+                        # Flush errors are non-critical, just log them
+                        print(f"[PrinterHandler] Flush warning (non-critical): {flush_error}")
                 
                 print(f"[PrinterHandler] Print job completed successfully")
                 return {
@@ -519,12 +557,10 @@ class PrinterHandler:
     @staticmethod
     def _load_chunk_size():
         """Get chunk size for USB writes (env adjustable)."""
-        # Windows libusb implementations tend to time out on large writes,
-        # so use conservative defaults that can be overridden via env.
-        default_size = 128 if os.name == 'nt' else 2048
+        # Use conservative chunk size by default to avoid libusb timeouts.
+        default_size = 128
         try:
             value = int(os.getenv('PRINTER_WRITE_CHUNK_SIZE', default_size))
-            # Allow values from 64 to 8192 (don't force minimum to 256)
             return max(64, min(8192, value))
         except (TypeError, ValueError):
             return default_size
