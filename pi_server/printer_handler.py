@@ -311,7 +311,7 @@ class PrinterHandler:
                 
                 current_chunk_size = self.write_chunk_size
                 current_delay = self.write_chunk_delay
-                min_chunk_size = 64 if os.name == 'nt' else 256
+                min_chunk_size = 64  # Minimum chunk size for retry logic
                 index = 0
                 reinitialized_once = False
                 
@@ -371,6 +371,24 @@ class PrinterHandler:
                         
                         # For non-timeout errors, re-raise to be handled by outer exception handler
                         raise
+                
+                # Ensure all data is sent and printer processes the commands
+                # This is critical for feed/cut commands at the end of the ESC/POS sequence
+                try:
+                    if hasattr(self.printer, 'flush'):
+                        # Network/Serial printer with flush method
+                        self.printer.flush()
+                    elif hasattr(self.printer, 'device') and hasattr(self.printer, 'out_ep'):
+                        # USB printer - ensure write completes
+                        # USB endpoints don't have flush, but we can ensure the last write completes
+                        # by adding a small delay to allow the USB stack to send the data
+                        time.sleep(0.15)  # Slightly longer delay for USB to ensure buffer is sent
+                    else:
+                        # Fallback: delay to ensure buffer is sent
+                        time.sleep(0.15)
+                except Exception as flush_error:
+                    # Flush errors are non-critical, just log them
+                    print(f"[PrinterHandler] Flush warning (non-critical): {flush_error}")
                 
                 print(f"[PrinterHandler] Print job completed successfully")
                 return {
@@ -506,7 +524,8 @@ class PrinterHandler:
         default_size = 128 if os.name == 'nt' else 2048
         try:
             value = int(os.getenv('PRINTER_WRITE_CHUNK_SIZE', default_size))
-            return max(256, min(8192, value))
+            # Allow values from 64 to 8192 (don't force minimum to 256)
+            return max(64, min(8192, value))
         except (TypeError, ValueError):
             return default_size
 
